@@ -1,178 +1,1106 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="manifest" href="manifest.json"><link rel="icon" href="assets/icons/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="assets/icons/icon-180.png"><meta name="theme-color" content="#2563eb"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>LocalDrop</title>
-<style>
-:root{--bg:#fff;--fg:#0f172a;--card:#f1f5f9;--ac:#2563eb}
-@media(prefers-color-scheme:dark){:root{--bg:#0f172a;--fg:#e2e8f0;--card:#1e293b;--ac:#60a5fa}}
-body{margin:0;font:15px system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:720px;margin:auto;padding:12px}
-section{background:var(--card);border-radius:12px;padding:12px;margin:12px 0}
-button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:10px 14px;margin:3px;font-size:14px}
-button.s{background:transparent;color:var(--ac);border:1px solid var(--ac)}
-textarea{width:100%;height:80px;box-sizing:border-box;font:11px monospace}
-.f{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #8884;gap:6px}
-.f span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-progress{width:100%}
-.notify{display:flex;align-items:center;gap:8px;margin:6px 0}.notify small{line-height:1.35}
-</style></head><body>
-<h2>LocalDrop <small>(PoC)</small></h2>
-<section><b>1. Library</b> <small id="stor"></small><br>
-<input type="file" id="pick" multiple hidden><button onclick="pick.click()">Import files</button>
-<div id="list"></div></section>
-<section><b>2. Connect</b> — <span id="st">not connected</span><br>
-<button onclick="create()">1. Make code</button><button class="s" onclick="pasteCode()">2. Paste code</button><button class="s" onclick="scan()">Scan QR</button><button class="s" onclick="copyOut()">Copy code</button>
-<div class="notify"><button class="s" id="notifyBtn" onclick="toggleNotifications()">Enable notifications</button><small id="notifyStatus" aria-live="polite">Optional alerts for completed transfers.</small></div>
-<div id="qrbox"></div><video id="vid" playsinline muted hidden style="width:100%;max-width:320px" onclick="stopScan()"></video>
-<div id="msg"><small>Device A: “Make code” (QR appears). Device B: “Scan QR” → its answer QR appears. Device A: “Scan QR” again. Copy/paste still works as a fallback.</small></div>
-<textarea id="inp" placeholder="Or paste the code here" oninput="auto()"></textarea>
-<textarea id="out" readonly hidden></textarea></section>
-<section><b>3. Transfers</b><div id="tr"></div></section>
-<script src="assets/vendor/qrcode.js"></script><script src="assets/vendor/jsQR.js"></script>
-<script>
-const $=id=>document.getElementById(id),CH=65536,HIGH=1<<20,MAXHASH=200<<20;
-let swReg=null;
-let alertsEnabled=false;try{alertsEnabled=localStorage.getItem('localdrop-alerts')==='1'}catch(e){}
-if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').then(r=>{swReg=r;updateNotifyUI()}).catch(()=>updateNotifyUI());
-// ---------- DB ----------
-let db;const dbp=new Promise((res,rej)=>{const r=indexedDB.open('LocalDropDB',1);
-r.onupgradeneeded=()=>{const d=r.result;d.createObjectStore('Files',{keyPath:'id'});d.createObjectStore('Transfers',{keyPath:'id'});d.createObjectStore('Settings',{keyPath:'key'})};
-r.onsuccess=()=>{db=r.result;res()};r.onerror=()=>rej(r.error)});
-const req=(s,m,f)=>new Promise((res,rej)=>{const t=db.transaction(s,m),o=t.objectStore(s),r=f(o);t.oncomplete=()=>res(r&&r.result);t.onerror=t.onabort=()=>rej(t.error)});
-const cat=t=>t.startsWith('image/')?'Images':t.startsWith('video/')?'Videos':t.startsWith('audio/')?'Audio':/pdf|text|word|sheet|presentation/.test(t)?'Documents':/zip|rar|7z|tar|gzip/.test(t)?'Archives':'Other';
-async function saveFile(blob,name,type,mod,checksum){
- const rec={id:crypto.randomUUID(),name,type:type||'application/octet-stream',size:blob.size,blob,createdAt:Date.now(),lastModified:mod||Date.now(),category:cat(type||''),checksum:checksum||null};
- try{await req('Files','readwrite',o=>o.put(rec))}catch(e){alert(e&&e.name==='QuotaExceededError'?'Storage full — file not saved':'Save failed: '+e);throw e}
- return rec}
-const all=()=>req('Files','readonly',o=>o.getAll());
-const fmt=n=>n>1e9?(n/1e9).toFixed(2)+' GB':n>1e6?(n/1e6).toFixed(1)+' MB':(n/1e3).toFixed(0)+' KB';
-async function render(){const fs=(await all()).sort((a,b)=>b.createdAt-a.createdAt);
- $('list').innerHTML='';if(!fs.length)$('list').textContent='No files yet.';
- fs.forEach(f=>{const d=document.createElement('div');d.className='f';
-  d.innerHTML=`<span title="${f.name.replace(/"/g,'')}"></span><small>${fmt(f.size)}</small>`;d.firstChild.textContent=f.name;
-  const b=(t,fn)=>{const x=document.createElement('button');x.className='s';x.textContent=t;x.onclick=fn;d.append(x)};
-  b('Send',()=>sendFile(f));b('Save',()=>{const a=document.createElement('a');a.href=URL.createObjectURL(f.blob);a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),6e4)});
-  b('Delete',async()=>{if(confirm('Delete '+f.name+'?')){await req('Files','readwrite',o=>o.delete(f.id));render()}});
-  $('list').append(d)});
- if(navigator.storage&&navigator.storage.estimate){const e=await navigator.storage.estimate();$('stor').textContent=`· ${fmt(e.usage)} / ${fmt(e.quota)}`}}
-$('pick').onchange=async e=>{for(const f of e.target.files)await saveFile(f,f.name,f.type,f.lastModified);e.target.value='';render()};
-dbp.then(()=>{render();navigator.storage&&navigator.storage.persist&&navigator.storage.persist()});
-// ---------- signaling codec ----------
-async function pipe(data,Stream){const s=new Blob([data]).stream().pipeThrough(new Stream('deflate-raw'));return new Uint8Array(await new Response(s).arrayBuffer())}
-async function enc(desc){const u=await pipe(JSON.stringify(desc),CompressionStream);let s='';u.forEach(c=>s+=String.fromCharCode(c));return btoa(s)}
-async function dec(t){const s=atob(t.trim()),u=Uint8Array.from(s,c=>c.charCodeAt(0));return JSON.parse(new TextDecoder().decode(await pipe(u,DecompressionStream)))}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="icon" href="assets/icons/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="assets/icons/icon-180.png" />
+    <meta name="theme-color" content="#2563eb" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>LocalDrop</title>
+    <style>
+      :root {
+        --bg: #fff;
+        --fg: #0f172a;
+        --card: #f1f5f9;
+        --ac: #2563eb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f172a;
+          --fg: #e2e8f0;
+          --card: #1e293b;
+          --ac: #60a5fa;
+        }
+      }
+      body {
+        margin: 0;
+        font:
+          15px system-ui,
+          sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        max-width: 720px;
+        margin: auto;
+        padding: 12px;
+      }
+      section {
+        background: var(--card);
+        border-radius: 12px;
+        padding: 12px;
+        margin: 12px 0;
+      }
+      button {
+        background: var(--ac);
+        color: #fff;
+        border: 0;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 3px;
+        font-size: 14px;
+      }
+      button.s {
+        background: transparent;
+        color: var(--ac);
+        border: 1px solid var(--ac);
+      }
+      textarea {
+        width: 100%;
+        height: 80px;
+        box-sizing: border-box;
+        font: 11px monospace;
+      }
+      .f {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 6px 0;
+        border-bottom: 1px solid #8884;
+        gap: 6px;
+      }
+      .f span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+      }
+      progress {
+        width: 100%;
+      }
+      .library-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 10px 0;
+      }
+      .view-switch {
+        display: flex;
+        gap: 4px;
+      }
+      .view-switch button {
+        margin: 0;
+        padding: 7px 10px;
+      }
+      .view-switch button[aria-pressed="true"] {
+        background: var(--ac);
+        color: #fff;
+      }
+      .file-list {
+        display: flex;
+        flex-direction: column;
+        overflow: visible;
+      }
+      .file-list[data-view="grid"],
+      .file-list[data-view="thumbnails"] {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        align-items: start;
+        gap: 10px;
+      }
+      .file-list[data-view="thumbnails"] {
+        grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      }
+      .file-item {
+        position: relative;
+        min-width: 0;
+      }
+      .file-item.list {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 4px;
+        border-bottom: 1px solid #8884;
+      }
+      .file-item.grid,
+      .file-item.thumbnails {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 8px;
+        border: 1px solid #8884;
+        border-radius: 10px;
+        background: var(--bg);
+      }
+      .file-preview {
+        display: grid;
+        flex: 0 0 52px;
+        width: 52px;
+        height: 52px;
+        place-items: center;
+        overflow: hidden;
+        border-radius: 8px;
+        background: linear-gradient(145deg, #dbeafe, #eff6ff);
+        color: #1d4ed8;
+      }
+      .file-preview img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .file-type-icon {
+        max-width: 90%;
+        overflow: hidden;
+        font-size: 12px;
+        font-weight: 750;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .file-info {
+        flex: 1;
+        min-width: 0;
+      }
+      .file-name,
+      .file-subtitle {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .file-name {
+        font-weight: 650;
+      }
+      .file-subtitle,
+      .file-count {
+        opacity: 0.72;
+        font-size: 12px;
+      }
+      .file-actions {
+        display: flex;
+        flex: 0 0 auto;
+        flex-wrap: wrap;
+        gap: 3px;
+      }
+      .file-actions button {
+        margin: 0;
+        padding: 6px 8px;
+        font-size: 12px;
+      }
+      .file-item.grid .file-preview,
+      .file-item.thumbnails .file-preview {
+        flex: none;
+        width: 100%;
+        height: 112px;
+      }
+      .file-item.thumbnails .file-preview {
+        height: 172px;
+      }
+      .file-detail {
+        position: absolute;
+        z-index: 5;
+        top: calc(100% + 4px);
+        left: 4px;
+        display: none;
+        width: min(280px, calc(100vw - 56px));
+        padding: 10px;
+        border: 1px solid #8888;
+        border-radius: 10px;
+        background: var(--bg);
+        box-shadow: 0 10px 30px #0003;
+        pointer-events: none;
+      }
+      .file-item:hover .file-detail,
+      .file-item:focus-within .file-detail,
+      .file-item.show-details .file-detail {
+        display: block;
+      }
+      .file-detail img {
+        display: block;
+        width: 100%;
+        max-height: 180px;
+        margin-bottom: 8px;
+        border-radius: 6px;
+        background: var(--card);
+        object-fit: contain;
+      }
+      .file-detail strong {
+        display: block;
+        overflow-wrap: anywhere;
+        margin-bottom: 6px;
+      }
+      .file-detail p {
+        margin: 3px 0;
+        font-size: 12px;
+        opacity: 0.8;
+        overflow-wrap: anywhere;
+      }
+      @media (max-width: 480px) {
+        .file-item.list {
+          flex-wrap: wrap;
+        }
+        .file-item.list .file-actions {
+          width: 100%;
+          margin-left: 62px;
+        }
+      }
+      .notify {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0;
+      }
+      .notify small {
+        line-height: 1.35;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>LocalDrop <small>(PoC)</small></h2>
+    <section>
+      <b>1. Library</b> <small id="stor"></small><br />
+      <input type="file" id="pick" multiple hidden /><button
+        onclick="pick.click()"
+      >
+        Import files
+      </button>
+      <div class="library-toolbar">
+        <div class="view-switch" role="group" aria-label="File display">
+          <button class="s" data-view-button="list" onclick="setFileView('list')" aria-pressed="true">List</button>
+          <button class="s" data-view-button="grid" onclick="setFileView('grid')" aria-pressed="false">Grid</button>
+          <button class="s" data-view-button="thumbnails" onclick="setFileView('thumbnails')" aria-pressed="false">Thumbnails</button>
+        </div>
+        <small class="file-count" id="fileCount" aria-live="polite"></small>
+      </div>
+      <div id="list" class="file-list" data-view="list"></div>
+    </section>
+    <section>
+      <b>2. Connect</b> — <span id="st">not connected</span><br />
+      <button onclick="create()">1. Make code</button
+      ><button class="s" onclick="pasteCode()">2. Paste code</button
+      ><button class="s" onclick="scan()">Scan QR</button
+      ><button class="s" onclick="copyOut()">Copy code</button>
+      <div class="notify">
+        <button class="s" id="notifyBtn" onclick="toggleNotifications()">
+          Enable notifications</button
+        ><small id="notifyStatus" aria-live="polite"
+          >Optional alerts for completed transfers.</small
+        >
+      </div>
+      <div id="qrbox"></div>
+      <video
+        id="vid"
+        playsinline
+        muted
+        hidden
+        style="width: 100%; max-width: 320px"
+        onclick="stopScan()"
+      ></video>
+      <div id="msg">
+        <small
+          >Device A: “Make code” (QR appears). Device B: “Scan QR” → its answer
+          QR appears. Device A: “Scan QR” again. Copy/paste still works as a
+          fallback.</small
+        >
+      </div>
+      <textarea
+        id="inp"
+        placeholder="Or paste the code here"
+        oninput="auto()"
+      ></textarea>
+      <textarea id="out" readonly hidden></textarea>
+    </section>
+    <section>
+      <b>3. Transfers</b>
+      <div id="tr"></div>
+    </section>
+    <script src="assets/vendor/qrcode.js"></script>
+    <script src="assets/vendor/jsQR.js"></script>
+    <script>
+      const $ = (id) => document.getElementById(id),
+        CH = 65536,
+        HIGH = 1 << 20,
+        MAXHASH = 200 << 20;
+      let swReg = null;
+      let alertsEnabled = false;
+      try {
+        alertsEnabled = localStorage.getItem("localdrop-alerts") === "1";
+      } catch (e) {}
+      if ("serviceWorker" in navigator)
+        navigator.serviceWorker
+          .register("sw.js")
+          .then((r) => {
+            swReg = r;
+            updateNotifyUI();
+          })
+          .catch(() => updateNotifyUI());
+      // ---------- DB ----------
+      let db;
+      const dbp = new Promise((res, rej) => {
+        const r = indexedDB.open("LocalDropDB", 1);
+        r.onupgradeneeded = () => {
+          const d = r.result;
+          d.createObjectStore("Files", { keyPath: "id" });
+          d.createObjectStore("Transfers", { keyPath: "id" });
+          d.createObjectStore("Settings", { keyPath: "key" });
+        };
+        r.onsuccess = () => {
+          db = r.result;
+          res();
+        };
+        r.onerror = () => rej(r.error);
+      });
+      const req = (s, m, f) =>
+        new Promise((res, rej) => {
+          const t = db.transaction(s, m),
+            o = t.objectStore(s),
+            r = f(o);
+          t.oncomplete = () => res(r && r.result);
+          t.onerror = t.onabort = () => rej(t.error);
+        });
+      const cat = (t) =>
+        t.startsWith("image/")
+          ? "Images"
+          : t.startsWith("video/")
+            ? "Videos"
+            : t.startsWith("audio/")
+              ? "Audio"
+              : /pdf|text|word|sheet|presentation/.test(t)
+                ? "Documents"
+                : /zip|rar|7z|tar|gzip/.test(t)
+                  ? "Archives"
+                  : "Other";
+      async function saveFile(blob, name, type, mod, checksum) {
+        const rec = {
+          id: crypto.randomUUID(),
+          name,
+          type: type || "application/octet-stream",
+          size: blob.size,
+          blob,
+          createdAt: Date.now(),
+          lastModified: mod || Date.now(),
+          category: cat(type || ""),
+          checksum: checksum || null,
+        };
+        try {
+          await req("Files", "readwrite", (o) => o.put(rec));
+        } catch (e) {
+          alert(
+            e && e.name === "QuotaExceededError"
+              ? "Storage full — file not saved"
+              : "Save failed: " + e,
+          );
+          throw e;
+        }
+        return rec;
+      }
+      const all = () => req("Files", "readonly", (o) => o.getAll());
+      const fmt = (n) =>
+        n > 1e9
+          ? (n / 1e9).toFixed(2) + " GB"
+          : n > 1e6
+            ? (n / 1e6).toFixed(1) + " MB"
+            : (n / 1e3).toFixed(0) + " KB";
+      let fileView = "list";
+      let previewUrls = [];
+      try {
+        const savedView = localStorage.getItem("localdrop-file-view");
+        if (["list", "grid", "thumbnails"].includes(savedView))
+          fileView = savedView;
+      } catch (e) {}
+      function setFileView(view) {
+        if (!["list", "grid", "thumbnails"].includes(view)) return;
+        fileView = view;
+        try {
+          localStorage.setItem("localdrop-file-view", view);
+        } catch (e) {}
+        render();
+      }
+      async function render() {
+        const fs = (await all()).sort((a, b) => b.createdAt - a.createdAt);
+        previewUrls.forEach((url) => URL.revokeObjectURL(url));
+        previewUrls = [];
+        const list = $("list");
+        list.innerHTML = "";
+        list.dataset.view = fileView;
+        document.querySelectorAll("[data-view-button]").forEach((button) => {
+          button.setAttribute(
+            "aria-pressed",
+            String(button.dataset.viewButton === fileView),
+          );
+        });
+        $("fileCount").textContent = `${fs.length} file${fs.length === 1 ? "" : "s"}`;
+        if (!fs.length) {
+          list.textContent = "No files yet.";
+          if (navigator.storage && navigator.storage.estimate) {
+            const e = await navigator.storage.estimate();
+            $("stor").textContent = `· ${fmt(e.usage)} / ${fmt(e.quota)}`;
+          }
+          return;
+        }
+        fs.forEach((f) => {
+          const d = document.createElement("article");
+          d.className = `file-item ${fileView}`;
+          d.tabIndex = 0;
+          const type = f.type || "Unknown type";
+          const modified = new Date(f.lastModified || f.createdAt).toLocaleString();
+          d.title = `${f.name}\n${f.category} · ${fmt(f.size)}\n${type}\nModified: ${modified}`;
+          d.setAttribute("aria-label", `${f.name}, ${f.category}, ${fmt(f.size)}`);
 
-// ---------- QR (qrcode-generator + jsQR, bundled locally; BarcodeDetector used when available) ----------
-let qt=null,sc=null,stopScan=()=>{};
-function showQR(code){clearInterval(qt);const box=$('qrbox');box.innerHTML='';
- if(!window.qrcode){box.textContent='QR library missing (assets/vendor/qrcode.js) — use Copy code.';return}
- const id=Math.random().toString(36).slice(2,6),N=380,n=Math.ceil(code.length/N),fr=[];
- for(let i=0;i<n;i++)fr.push('LD|'+id+'|'+i+'|'+n+'|'+code.slice(i*N,(i+1)*N));
- const img=new Image(),cap=document.createElement('small');img.style.cssText='width:100%;max-width:320px;background:#fff;image-rendering:pixelated';
- box.append(img,document.createElement('br'),cap);let k=0;
- const draw=()=>{const q=qrcode(0,'L');q.addData(fr[k]);q.make();img.src=q.createDataURL(4,16);cap.textContent='QR '+(k+1)+'/'+n+(n>1?' — frames cycle, keep the scanner on it':'');k=(k+1)%n};
- draw();if(n>1)qt=setInterval(draw,1200)}
-async function scan(){if(!navigator.mediaDevices)return msg('Camera needs HTTPS or localhost.');
- const bd=window.BarcodeDetector?new BarcodeDetector({formats:['qr_code']}):null;
- if(!bd&&!window.jsQR)return msg('No QR decoder available (assets/vendor/jsQR.js missing). Use Paste code.');
- let st;try{st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}})}catch(e){return msg('Camera blocked: '+e.name)}
- clearInterval(qt);$('qrbox').innerHTML='';const v=$('vid');v.srcObject=st;v.hidden=false;await v.play();
- const cv=document.createElement('canvas'),cx=cv.getContext('2d',{willReadFrequently:true}),got={};let id=null,n=0,bz=false;
- stopScan=()=>{clearInterval(sc);st.getTracks().forEach(t=>t.stop());v.hidden=true};msg('Point the camera at the other device’s QR (tap video to cancel)');
- sc=setInterval(async()=>{if(bz||v.readyState<2)return;bz=true;
-  try{cv.width=v.videoWidth;cv.height=v.videoHeight;cx.drawImage(v,0,0);let t=null;
-   if(bd){const r=await bd.detect(cv);t=r[0]&&r[0].rawValue}else{const d=cx.getImageData(0,0,cv.width,cv.height),r=jsQR(d.data,d.width,d.height);t=r&&r.data}
-   if(t&&t.startsWith('LD|')){const p=t.split('|');if(id!==p[1]){id=p[1];n=+p[3];for(const k in got)delete got[k]}
-    got[p[2]]=p.slice(4).join('|');const c=Object.keys(got).length;msg('Scanning… '+c+'/'+n);
-    if(c===n){stopScan();let s='';for(let i=0;i<n;i++)s+=got[i];$('inp').value=s;auto()}}
-  }catch(e){}bz=false},150)}
-// ---------- WebRTC ----------
-let pc,dc;
-function mk(){pc=new RTCPeerConnection({iceServers:[]});
- pc.onconnectionstatechange=()=>{$('st').textContent=pc.connectionState;if(pc.connectionState==='failed')$('st').textContent='failed — check Wi-Fi client isolation / firewall'};
- pc.ondatachannel=e=>setup(e.channel)}
-function gathered(){return new Promise(r=>{if(pc.iceGatheringState==='complete')return r();
- pc.addEventListener('icegatheringstatechange',()=>pc.iceGatheringState==='complete'&&r());setTimeout(r,5000)})}
-let busy=false;const msg=t=>$('msg').textContent=t;
-async function copyOut(){if(!$('out').value)return msg('No code yet — tap “Make code” or paste the other device’s code');
- try{await navigator.clipboard.writeText($('out').value);msg('✓ Code copied. Paste it on the other device.')}catch(e){$('out').hidden=false;$('out').select();msg('Copy the code from the box below.')}}
-async function create(){msg('Making code…');mk();setup(pc.createDataChannel('ld',{ordered:true}));
- await pc.setLocalDescription(await pc.createOffer());await gathered();$('out').value=await enc(pc.localDescription);showQR($('out').value);await copyOut()}
-async function pasteCode(){try{$('inp').value=await navigator.clipboard.readText()}catch(e){return msg('Paste manually into the box below.')}auto()}
-async function auto(){const v=$('inp').value.trim();if(v.length<40||busy)return;busy=true;
- try{const d=await dec(v);
-  if(d.type==='offer'){msg('Making answer…');mk();await pc.setRemoteDescription(d);await pc.setLocalDescription(await pc.createAnswer());await gathered();$('out').value=await enc(pc.localDescription);showQR($('out').value);await copyOut()}
-  else if(d.type==='answer'&&pc&&pc.signalingState==='have-local-offer'){await pc.setRemoteDescription(d);msg('Connecting…')}
-  else msg('This code doesn’t fit here — start with “Make code” on one device.')
- }catch(e){msg('Invalid code — copy it again in full.')}
- $('inp').value='';busy=false}
-function setup(ch){dc=ch;dc.binaryType='arraybuffer';dc.bufferedAmountLowThreshold=CH*4;
- dc.onopen=()=>{$('st').textContent='connected — data channel open';clearInterval(qt);$('qrbox').innerHTML=''};dc.onclose=()=>$('st').textContent='disconnected';
- dc.onmessage=onMsg;
- dc.addEventListener('open',()=>notify('Connected','A peer-to-peer connection is ready.','connection-open'));
- dc.addEventListener('close',()=>notify('Connection closed','The peer-to-peer session has ended.','connection-closed'))}
-function updateNotifyUI(){
- const b=$('notifyBtn'),s=$('notifyStatus');if(!b||!s)return;
- if(!('Notification'in window)){b.disabled=true;b.textContent='Notifications unavailable';s.textContent=isSecureContext?'This browser does not support notifications.':'Notifications require HTTPS or localhost.';return}
- if(/iPhone|iPad|iPod/.test(navigator.userAgent)&&!navigator.standalone&&!matchMedia('(display-mode: standalone)').matches){b.disabled=true;b.textContent='Install for notifications';s.textContent='On iPhone or iPad, add LocalDrop to the Home Screen first.';return}
- if(Notification.permission==='granted'){b.disabled=false;b.textContent=alertsEnabled?'Turn off alerts':'Turn on alerts';s.textContent=alertsEnabled?'Transfer and connection alerts are on.':'Notifications are allowed; alerts are off.'}
- else if(Notification.permission==='denied'){b.disabled=true;b.textContent='Notifications blocked';s.textContent='Allow notifications for this site in browser settings.'}
- else{b.disabled=false;b.textContent='Enable notifications';s.textContent='Optional alerts for transfers while LocalDrop is open.'}
-}
-async function toggleNotifications(){
- if(!('Notification'in window))return updateNotifyUI();
- if(Notification.permission==='granted'){
-  alertsEnabled=!alertsEnabled;try{localStorage.setItem('localdrop-alerts',alertsEnabled?'1':'0')}catch(e){}
-  updateNotifyUI();if(alertsEnabled)await notify('LocalDrop alerts enabled','You’ll be alerted when transfers finish.','notifications-enabled');return
- }
- try{
-  const permission=await Notification.requestPermission();updateNotifyUI();
-  if(permission==='granted'){alertsEnabled=true;try{localStorage.setItem('localdrop-alerts','1')}catch(e){};updateNotifyUI();await notify('LocalDrop alerts enabled','You’ll be alerted when transfers finish.','notifications-enabled')}
- }catch(e){$('notifyStatus').textContent='Could not enable notifications in this browser.'}
-}
-async function notify(title,body,tag){
- if(!alertsEnabled||!('Notification'in window)||Notification.permission!=='granted')return;
- const options={body,icon:'assets/icons/icon-192.png',badge:'assets/icons/icon-192.png',tag,renotify:false,data:{url:'./'}};
- try{
-  const reg=swReg||('serviceWorker'in navigator?await navigator.serviceWorker.getRegistration():null);
-  if(reg&&reg.showNotification)await reg.showNotification(title,options);else new Notification(title,options);
- }catch(e){}
-}
-window.addEventListener('focus',updateNotifyUI);updateNotifyUI();
-// ---------- transfer ----------
-const J=o=>dc.send(JSON.stringify(o)),waits={},rows={};let rx=null;
-const sha=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(x=>x.toString(16).padStart(2,'0')).join('');
-function row(id,label){const d=document.createElement('div');d.innerHTML='<div></div><progress max="1" value="0"></progress><small></small> <button class="s">Cancel</button>';
- d.firstChild.textContent=label;$('tr').prepend(d);return rows[id]={d,p:d.children[1],s:d.children[2],b:d.children[3],t0:Date.now(),cancel:false}}
-function prog(r,done,size){r.p.value=done/size;const sp=done/Math.max(1,(Date.now()-r.t0)/1000);r.s.textContent=`${fmt(done)}/${fmt(size)} · ${fmt(sp)}/s · ~${Math.round((size-done)/Math.max(sp,1))}s left`}
-const wait=(id)=>new Promise(r=>waits[id]=r);
-async function sendFile(f){if(!dc||dc.readyState!=='open')return alert('Not connected');
- const id=crypto.randomUUID(),r=row(id,'↑ '+f.name);r.s.textContent='Hashing…';
- const sum=f.size<=MAXHASH?await sha(await f.blob.arrayBuffer()):null;
- J({t:'FILE_OFFER',id,name:f.name,type:f.type,size:f.size,chunkSize:CH,chunks:Math.ceil(f.size/CH),mod:f.lastModified});
- r.b.onclick=()=>{r.cancel=true;try{J({t:'FILE_CANCEL',id})}catch(e){};waits[id]&&waits[id](false)};
- r.s.textContent='Waiting for receiver…';
- if(!(await wait(id))){r.s.textContent=r.cancel?'Cancelled':'Rejected/cancelled';if(!r.cancel)notify('Transfer declined',`${f.name} was declined by the receiving device.`,'declined-'+id);return}
- r.t0=Date.now();let off=0;
- try{while(off<f.size&&!r.cancel){
-  if(dc.bufferedAmount>HIGH)await new Promise(res=>dc.onbufferedamountlow=res);
-  const buf=await f.blob.slice(off,off+CH).arrayBuffer();dc.send(buf);off+=buf.byteLength;prog(r,off,f.size)}
- if(r.cancel){r.s.textContent='Cancelled';notify('Transfer cancelled',`${f.name} was cancelled.`,'cancelled-'+id);return}
- J({t:'FILE_COMPLETE',id,sha256:sum});r.s.textContent='Verifying on receiver…';
- const ok=await wait(id+'a');r.s.textContent=ok?'✓ Delivered & verified'+(sum?' (SHA-256)':' (size only; >200 MB)'):'✗ Verification failed';r.b.remove();
- notify(ok?'File sent':'Transfer failed',ok?`${f.name} · ${fmt(f.size)} · verified on the receiving device.`:`${f.name} could not be verified or saved.`,(ok?'sent-':'failed-')+id)
- }catch(e){r.s.textContent='Error: '+e.message;notify('Transfer failed',`${f.name}: ${e.message}`,'error-'+id)}}
-async function onMsg(e){
- if(typeof e.data!=='string'){if(!rx||rx.dead)return;rx.parts.push(e.data);rx.got+=e.data.byteLength;prog(rx.r,rx.got,rx.size);return}
- const m=JSON.parse(e.data);
- if(m.t==='FILE_OFFER'){if(!confirm(`Receive ${m.name} (${fmt(m.size)})?`)){J({t:'FILE_REJECT',id:m.id});return}
-  const r=row(m.id,'↓ '+m.name);rx={...m,parts:[],got:0,r};r.b.onclick=()=>{rx.dead=true;J({t:'FILE_CANCEL',id:m.id});r.s.textContent='Cancelled'};J({t:'FILE_ACCEPT',id:m.id})}
- else if(m.t==='FILE_ACCEPT'){waits[m.id]&&waits[m.id](true)}
- else if(m.t==='FILE_REJECT'){waits[m.id]&&waits[m.id](false)}
- else if(m.t==='FILE_CANCEL'){if(rx&&rx.id===m.id){rx.dead=true;rx.r.s.textContent='Cancelled by sender';notify('Transfer cancelled',`${rx.name} was cancelled by the sending device.`,'remote-cancel-'+m.id)}if(rows[m.id])rows[m.id].cancel=true;waits[m.id]&&waits[m.id](false)}
- else if(m.t==='FILE_COMPLETE'&&rx&&rx.id===m.id&&!rx.dead){
-  const blob=new Blob(rx.parts,{type:rx.type});let ok=blob.size===rx.size;
-  if(ok&&m.sha256)ok=(await sha(await blob.arrayBuffer()))===m.sha256;
-  if(ok){try{await saveFile(blob,rx.name,rx.type,rx.mod,m.sha256);render()}catch(e){ok=false}}
-  rx.r.s.textContent=ok?'✓ Saved to library (verified)':'✗ Verification/save failed';rx.r.b.remove();J({t:'TRANSFER_ACK',id:m.id,ok});
-  notify(ok?'File received':'Could not save file',ok?`${rx.name} · ${fmt(rx.size)} · saved and verified.`:`${rx.name} failed verification or could not be saved.`,(ok?'received-':'receive-failed-')+m.id);rx=null}
- else if(m.t==='TRANSFER_ACK'){waits[m.id+'a']&&waits[m.id+'a'](m.ok)}
- else if(m.t==='PING')J({t:'PONG'})}
-</script></body></html>
+          const imageFile =
+            (f.type || "").startsWith("image/") || /\.(avif|gif|jpe?g|png|svg|webp)$/i.test(f.name);
+          const preview = document.createElement("div");
+          preview.className = "file-preview";
+          if (imageFile) {
+            const url = URL.createObjectURL(f.blob);
+            previewUrls.push(url);
+            const img = document.createElement("img");
+            img.src = url;
+            img.alt = f.name;
+            img.loading = "lazy";
+            preview.append(img);
+          } else {
+            const badge = document.createElement("span");
+            badge.className = "file-type-icon";
+            badge.textContent = f.name.includes(".")
+              ? f.name.split(".").pop().slice(0, 6).toUpperCase()
+              : f.category.slice(0, 5).toUpperCase();
+            preview.append(badge);
+          }
+          d.append(preview);
+
+          const info = document.createElement("div");
+          info.className = "file-info";
+          const name = document.createElement("span");
+          name.className = "file-name";
+          name.textContent = f.name;
+          const subtitle = document.createElement("small");
+          subtitle.className = "file-subtitle";
+          subtitle.textContent = `${f.category} · ${fmt(f.size)}`;
+          info.append(name, subtitle);
+          d.append(info);
+
+          const detail = document.createElement("div");
+          detail.className = "file-detail";
+          detail.id = `file-detail-${f.id}`;
+          detail.setAttribute("role", "tooltip");
+          d.setAttribute("aria-describedby", detail.id);
+          if (imageFile) {
+            const img = document.createElement("img");
+            img.src = previewUrls[previewUrls.length - 1];
+            img.alt = "";
+            detail.append(img);
+          }
+          const detailName = document.createElement("strong");
+          detailName.textContent = f.name;
+          detail.append(detailName);
+          [
+            `Category: ${f.category}`,
+            `Type: ${type}`,
+            `Size: ${fmt(f.size)}`,
+            `Modified: ${modified}`,
+            ...(f.checksum ? [`SHA-256: ${f.checksum}`] : []),
+          ].forEach((text) => {
+            const p = document.createElement("p");
+            p.textContent = text;
+            detail.append(p);
+          });
+          d.append(detail);
+
+          const actions = document.createElement("div");
+          actions.className = "file-actions";
+          const b = (t, fn) => {
+            const x = document.createElement("button");
+            x.className = "s";
+            x.textContent = t;
+            x.onclick = fn;
+            actions.append(x);
+            return x;
+          };
+          const detailsButton = b("Details", (event) => {
+            const item = event.currentTarget.closest(".file-item");
+            const open = item.classList.toggle("show-details");
+            event.currentTarget.setAttribute("aria-expanded", String(open));
+          });
+          detailsButton.setAttribute("aria-expanded", "false");
+          b("Send", () => sendFile(f));
+          b("Save", () => {
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(f.blob);
+            a.download = f.name;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 6e4);
+          });
+          b("Delete", async () => {
+            if (confirm("Delete " + f.name + "?")) {
+              await req("Files", "readwrite", (o) => o.delete(f.id));
+              render();
+            }
+          });
+          d.append(actions);
+          list.append(d);
+        });
+        if (navigator.storage && navigator.storage.estimate) {
+          const e = await navigator.storage.estimate();
+          $("stor").textContent = `· ${fmt(e.usage)} / ${fmt(e.quota)}`;
+        }
+      }
+      $("pick").onchange = async (e) => {
+        for (const f of e.target.files)
+          await saveFile(f, f.name, f.type, f.lastModified);
+        e.target.value = "";
+        render();
+      };
+      dbp.then(() => {
+        render();
+        navigator.storage &&
+          navigator.storage.persist &&
+          navigator.storage.persist();
+      });
+      // ---------- signaling codec ----------
+      async function pipe(data, Stream) {
+        const s = new Blob([data])
+          .stream()
+          .pipeThrough(new Stream("deflate-raw"));
+        return new Uint8Array(await new Response(s).arrayBuffer());
+      }
+      async function enc(desc) {
+        const u = await pipe(JSON.stringify(desc), CompressionStream);
+        let s = "";
+        u.forEach((c) => (s += String.fromCharCode(c)));
+        return btoa(s);
+      }
+      async function dec(t) {
+        const s = atob(t.trim()),
+          u = Uint8Array.from(s, (c) => c.charCodeAt(0));
+        return JSON.parse(
+          new TextDecoder().decode(await pipe(u, DecompressionStream)),
+        );
+      }
+
+      // ---------- QR (qrcode-generator + jsQR, bundled locally; BarcodeDetector used when available) ----------
+      let qt = null,
+        sc = null,
+        stopScan = () => {};
+      function showQR(code) {
+        clearInterval(qt);
+        const box = $("qrbox");
+        box.innerHTML = "";
+        if (!window.qrcode) {
+          box.textContent =
+            "QR library missing (assets/vendor/qrcode.js) — use Copy code.";
+          return;
+        }
+        const id = Math.random().toString(36).slice(2, 6),
+          N = 380,
+          n = Math.ceil(code.length / N),
+          fr = [];
+        for (let i = 0; i < n; i++)
+          fr.push(
+            "LD|" +
+              id +
+              "|" +
+              i +
+              "|" +
+              n +
+              "|" +
+              code.slice(i * N, (i + 1) * N),
+          );
+        const img = new Image(),
+          cap = document.createElement("small");
+        img.style.cssText =
+          "width:100%;max-width:320px;background:#fff;image-rendering:pixelated";
+        box.append(img, document.createElement("br"), cap);
+        let k = 0;
+        const draw = () => {
+          const q = qrcode(0, "L");
+          q.addData(fr[k]);
+          q.make();
+          img.src = q.createDataURL(4, 16);
+          cap.textContent =
+            "QR " +
+            (k + 1) +
+            "/" +
+            n +
+            (n > 1 ? " — frames cycle, keep the scanner on it" : "");
+          k = (k + 1) % n;
+        };
+        draw();
+        if (n > 1) qt = setInterval(draw, 1200);
+      }
+      async function scan() {
+        if (!navigator.mediaDevices)
+          return msg("Camera needs HTTPS or localhost.");
+        const bd = window.BarcodeDetector
+          ? new BarcodeDetector({ formats: ["qr_code"] })
+          : null;
+        if (!bd && !window.jsQR)
+          return msg(
+            "No QR decoder available (assets/vendor/jsQR.js missing). Use Paste code.",
+          );
+        let st;
+        try {
+          st = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment" },
+          });
+        } catch (e) {
+          return msg("Camera blocked: " + e.name);
+        }
+        clearInterval(qt);
+        $("qrbox").innerHTML = "";
+        const v = $("vid");
+        v.srcObject = st;
+        v.hidden = false;
+        await v.play();
+        const cv = document.createElement("canvas"),
+          cx = cv.getContext("2d", { willReadFrequently: true }),
+          got = {};
+        let id = null,
+          n = 0,
+          bz = false;
+        stopScan = () => {
+          clearInterval(sc);
+          st.getTracks().forEach((t) => t.stop());
+          v.hidden = true;
+        };
+        msg("Point the camera at the other device’s QR (tap video to cancel)");
+        sc = setInterval(async () => {
+          if (bz || v.readyState < 2) return;
+          bz = true;
+          try {
+            cv.width = v.videoWidth;
+            cv.height = v.videoHeight;
+            cx.drawImage(v, 0, 0);
+            let t = null;
+            if (bd) {
+              const r = await bd.detect(cv);
+              t = r[0] && r[0].rawValue;
+            } else {
+              const d = cx.getImageData(0, 0, cv.width, cv.height),
+                r = jsQR(d.data, d.width, d.height);
+              t = r && r.data;
+            }
+            if (t && t.startsWith("LD|")) {
+              const p = t.split("|");
+              if (id !== p[1]) {
+                id = p[1];
+                n = +p[3];
+                for (const k in got) delete got[k];
+              }
+              got[p[2]] = p.slice(4).join("|");
+              const c = Object.keys(got).length;
+              msg("Scanning… " + c + "/" + n);
+              if (c === n) {
+                stopScan();
+                let s = "";
+                for (let i = 0; i < n; i++) s += got[i];
+                $("inp").value = s;
+                auto();
+              }
+            }
+          } catch (e) {}
+          bz = false;
+        }, 150);
+      }
+      // ---------- WebRTC ----------
+      let pc, dc;
+      function mk() {
+        pc = new RTCPeerConnection({ iceServers: [] });
+        pc.onconnectionstatechange = () => {
+          $("st").textContent = pc.connectionState;
+          if (pc.connectionState === "failed")
+            $("st").textContent =
+              "failed — check Wi-Fi client isolation / firewall";
+        };
+        pc.ondatachannel = (e) => setup(e.channel);
+      }
+      function gathered() {
+        return new Promise((r) => {
+          if (pc.iceGatheringState === "complete") return r();
+          pc.addEventListener(
+            "icegatheringstatechange",
+            () => pc.iceGatheringState === "complete" && r(),
+          );
+          setTimeout(r, 5000);
+        });
+      }
+      let busy = false;
+      const msg = (t) => ($("msg").textContent = t);
+      async function copyOut() {
+        if (!$("out").value)
+          return msg(
+            "No code yet — tap “Make code” or paste the other device’s code",
+          );
+        try {
+          await navigator.clipboard.writeText($("out").value);
+          msg("✓ Code copied. Paste it on the other device.");
+        } catch (e) {
+          $("out").hidden = false;
+          $("out").select();
+          msg("Copy the code from the box below.");
+        }
+      }
+      async function create() {
+        msg("Making code…");
+        mk();
+        setup(pc.createDataChannel("ld", { ordered: true }));
+        await pc.setLocalDescription(await pc.createOffer());
+        await gathered();
+        $("out").value = await enc(pc.localDescription);
+        showQR($("out").value);
+        await copyOut();
+      }
+      async function pasteCode() {
+        try {
+          $("inp").value = await navigator.clipboard.readText();
+        } catch (e) {
+          return msg("Paste manually into the box below.");
+        }
+        auto();
+      }
+      async function auto() {
+        const v = $("inp").value.trim();
+        if (v.length < 40 || busy) return;
+        busy = true;
+        try {
+          const d = await dec(v);
+          if (d.type === "offer") {
+            msg("Making answer…");
+            mk();
+            await pc.setRemoteDescription(d);
+            await pc.setLocalDescription(await pc.createAnswer());
+            await gathered();
+            $("out").value = await enc(pc.localDescription);
+            showQR($("out").value);
+            await copyOut();
+          } else if (
+            d.type === "answer" &&
+            pc &&
+            pc.signalingState === "have-local-offer"
+          ) {
+            await pc.setRemoteDescription(d);
+            msg("Connecting…");
+          } else
+            msg(
+              "This code doesn’t fit here — start with “Make code” on one device.",
+            );
+        } catch (e) {
+          msg("Invalid code — copy it again in full.");
+        }
+        $("inp").value = "";
+        busy = false;
+      }
+      function setup(ch) {
+        dc = ch;
+        dc.binaryType = "arraybuffer";
+        dc.bufferedAmountLowThreshold = CH * 4;
+        dc.onopen = () => {
+          $("st").textContent = "connected — data channel open";
+          clearInterval(qt);
+          $("qrbox").innerHTML = "";
+        };
+        dc.onclose = () => ($("st").textContent = "disconnected");
+        dc.onmessage = onMsg;
+        dc.addEventListener("open", () =>
+          notify(
+            "Connected",
+            "A peer-to-peer connection is ready.",
+            "connection-open",
+          ),
+        );
+        dc.addEventListener("close", () =>
+          notify(
+            "Connection closed",
+            "The peer-to-peer session has ended.",
+            "connection-closed",
+          ),
+        );
+      }
+      function updateNotifyUI() {
+        const b = $("notifyBtn"),
+          s = $("notifyStatus");
+        if (!b || !s) return;
+        if (!("Notification" in window)) {
+          b.disabled = true;
+          b.textContent = "Notifications unavailable";
+          s.textContent = isSecureContext
+            ? "This browser does not support notifications."
+            : "Notifications require HTTPS or localhost.";
+          return;
+        }
+        if (
+          /iPhone|iPad|iPod/.test(navigator.userAgent) &&
+          !navigator.standalone &&
+          !matchMedia("(display-mode: standalone)").matches
+        ) {
+          b.disabled = true;
+          b.textContent = "Install for notifications";
+          s.textContent =
+            "On iPhone or iPad, add LocalDrop to the Home Screen first.";
+          return;
+        }
+        if (Notification.permission === "granted") {
+          b.disabled = false;
+          b.textContent = alertsEnabled ? "Turn off alerts" : "Turn on alerts";
+          s.textContent = alertsEnabled
+            ? "Transfer and connection alerts are on."
+            : "Notifications are allowed; alerts are off.";
+        } else if (Notification.permission === "denied") {
+          b.disabled = true;
+          b.textContent = "Notifications blocked";
+          s.textContent =
+            "Allow notifications for this site in browser settings.";
+        } else {
+          b.disabled = false;
+          b.textContent = "Enable notifications";
+          s.textContent =
+            "Optional alerts for transfers while LocalDrop is open.";
+        }
+      }
+      async function toggleNotifications() {
+        if (!("Notification" in window)) return updateNotifyUI();
+        if (Notification.permission === "granted") {
+          alertsEnabled = !alertsEnabled;
+          try {
+            localStorage.setItem("localdrop-alerts", alertsEnabled ? "1" : "0");
+          } catch (e) {}
+          updateNotifyUI();
+          if (alertsEnabled)
+            await notify(
+              "LocalDrop alerts enabled",
+              "You’ll be alerted when transfers finish.",
+              "notifications-enabled",
+            );
+          return;
+        }
+        try {
+          const permission = await Notification.requestPermission();
+          updateNotifyUI();
+          if (permission === "granted") {
+            alertsEnabled = true;
+            try {
+              localStorage.setItem("localdrop-alerts", "1");
+            } catch (e) {}
+            updateNotifyUI();
+            await notify(
+              "LocalDrop alerts enabled",
+              "You’ll be alerted when transfers finish.",
+              "notifications-enabled",
+            );
+          }
+        } catch (e) {
+          $("notifyStatus").textContent =
+            "Could not enable notifications in this browser.";
+        }
+      }
+      async function notify(title, body, tag) {
+        if (
+          !alertsEnabled ||
+          !("Notification" in window) ||
+          Notification.permission !== "granted"
+        )
+          return;
+        const options = {
+          body,
+          icon: "assets/icons/icon-192.png",
+          badge: "assets/icons/icon-192.png",
+          tag,
+          renotify: false,
+          data: { url: "./" },
+        };
+        try {
+          const reg =
+            swReg ||
+            ("serviceWorker" in navigator
+              ? await navigator.serviceWorker.getRegistration()
+              : null);
+          if (reg && reg.showNotification)
+            await reg.showNotification(title, options);
+          else new Notification(title, options);
+        } catch (e) {}
+      }
+      window.addEventListener("focus", updateNotifyUI);
+      updateNotifyUI();
+      // ---------- transfer ----------
+      const J = (o) => dc.send(JSON.stringify(o)),
+        waits = {},
+        rows = {};
+      let rx = null;
+      const sha = async (b) =>
+        [...new Uint8Array(await crypto.subtle.digest("SHA-256", b))]
+          .map((x) => x.toString(16).padStart(2, "0"))
+          .join("");
+      function row(id, label) {
+        const d = document.createElement("div");
+        d.innerHTML =
+          '<div></div><progress max="1" value="0"></progress><small></small> <button class="s">Cancel</button>';
+        d.firstChild.textContent = label;
+        $("tr").prepend(d);
+        return (rows[id] = {
+          d,
+          p: d.children[1],
+          s: d.children[2],
+          b: d.children[3],
+          t0: Date.now(),
+          cancel: false,
+        });
+      }
+      function prog(r, done, size) {
+        r.p.value = done / size;
+        const sp = done / Math.max(1, (Date.now() - r.t0) / 1000);
+        r.s.textContent = `${fmt(done)}/${fmt(size)} · ${fmt(sp)}/s · ~${Math.round((size - done) / Math.max(sp, 1))}s left`;
+      }
+      const wait = (id) => new Promise((r) => (waits[id] = r));
+      async function sendFile(f) {
+        if (!dc || dc.readyState !== "open") return alert("Not connected");
+        const id = crypto.randomUUID(),
+          r = row(id, "↑ " + f.name);
+        r.s.textContent = "Hashing…";
+        const sum =
+          f.size <= MAXHASH ? await sha(await f.blob.arrayBuffer()) : null;
+        J({
+          t: "FILE_OFFER",
+          id,
+          name: f.name,
+          type: f.type,
+          size: f.size,
+          chunkSize: CH,
+          chunks: Math.ceil(f.size / CH),
+          mod: f.lastModified,
+        });
+        r.b.onclick = () => {
+          r.cancel = true;
+          try {
+            J({ t: "FILE_CANCEL", id });
+          } catch (e) {}
+          waits[id] && waits[id](false);
+        };
+        r.s.textContent = "Waiting for receiver…";
+        if (!(await wait(id))) {
+          r.s.textContent = r.cancel ? "Cancelled" : "Rejected/cancelled";
+          if (!r.cancel)
+            notify(
+              "Transfer declined",
+              `${f.name} was declined by the receiving device.`,
+              "declined-" + id,
+            );
+          return;
+        }
+        r.t0 = Date.now();
+        let off = 0;
+        try {
+          while (off < f.size && !r.cancel) {
+            if (dc.bufferedAmount > HIGH)
+              await new Promise((res) => (dc.onbufferedamountlow = res));
+            const buf = await f.blob.slice(off, off + CH).arrayBuffer();
+            dc.send(buf);
+            off += buf.byteLength;
+            prog(r, off, f.size);
+          }
+          if (r.cancel) {
+            r.s.textContent = "Cancelled";
+            notify(
+              "Transfer cancelled",
+              `${f.name} was cancelled.`,
+              "cancelled-" + id,
+            );
+            return;
+          }
+          J({ t: "FILE_COMPLETE", id, sha256: sum });
+          r.s.textContent = "Verifying on receiver…";
+          const ok = await wait(id + "a");
+          r.s.textContent = ok
+            ? "✓ Delivered & verified" +
+              (sum ? " (SHA-256)" : " (size only; >200 MB)")
+            : "✗ Verification failed";
+          r.b.remove();
+          notify(
+            ok ? "File sent" : "Transfer failed",
+            ok
+              ? `${f.name} · ${fmt(f.size)} · verified on the receiving device.`
+              : `${f.name} could not be verified or saved.`,
+            (ok ? "sent-" : "failed-") + id,
+          );
+        } catch (e) {
+          r.s.textContent = "Error: " + e.message;
+          notify("Transfer failed", `${f.name}: ${e.message}`, "error-" + id);
+        }
+      }
+      async function onMsg(e) {
+        if (typeof e.data !== "string") {
+          if (!rx || rx.dead) return;
+          rx.parts.push(e.data);
+          rx.got += e.data.byteLength;
+          prog(rx.r, rx.got, rx.size);
+          return;
+        }
+        const m = JSON.parse(e.data);
+        if (m.t === "FILE_OFFER") {
+          if (!confirm(`Receive ${m.name} (${fmt(m.size)})?`)) {
+            J({ t: "FILE_REJECT", id: m.id });
+            return;
+          }
+          const r = row(m.id, "↓ " + m.name);
+          rx = { ...m, parts: [], got: 0, r };
+          r.b.onclick = () => {
+            rx.dead = true;
+            J({ t: "FILE_CANCEL", id: m.id });
+            r.s.textContent = "Cancelled";
+          };
+          J({ t: "FILE_ACCEPT", id: m.id });
+        } else if (m.t === "FILE_ACCEPT") {
+          waits[m.id] && waits[m.id](true);
+        } else if (m.t === "FILE_REJECT") {
+          waits[m.id] && waits[m.id](false);
+        } else if (m.t === "FILE_CANCEL") {
+          if (rx && rx.id === m.id) {
+            rx.dead = true;
+            rx.r.s.textContent = "Cancelled by sender";
+            notify(
+              "Transfer cancelled",
+              `${rx.name} was cancelled by the sending device.`,
+              "remote-cancel-" + m.id,
+            );
+          }
+          if (rows[m.id]) rows[m.id].cancel = true;
+          waits[m.id] && waits[m.id](false);
+        } else if (
+          m.t === "FILE_COMPLETE" &&
+          rx &&
+          rx.id === m.id &&
+          !rx.dead
+        ) {
+          const blob = new Blob(rx.parts, { type: rx.type });
+          let ok = blob.size === rx.size;
+          if (ok && m.sha256)
+            ok = (await sha(await blob.arrayBuffer())) === m.sha256;
+          if (ok) {
+            try {
+              await saveFile(blob, rx.name, rx.type, rx.mod, m.sha256);
+              render();
+            } catch (e) {
+              ok = false;
+            }
+          }
+          rx.r.s.textContent = ok
+            ? "✓ Saved to library (verified)"
+            : "✗ Verification/save failed";
+          rx.r.b.remove();
+          J({ t: "TRANSFER_ACK", id: m.id, ok });
+          notify(
+            ok ? "File received" : "Could not save file",
+            ok
+              ? `${rx.name} · ${fmt(rx.size)} · saved and verified.`
+              : `${rx.name} failed verification or could not be saved.`,
+            (ok ? "received-" : "receive-failed-") + m.id,
+          );
+          rx = null;
+        } else if (m.t === "TRANSFER_ACK") {
+          waits[m.id + "a"] && waits[m.id + "a"](m.ok);
+        } else if (m.t === "PING") J({ t: "PONG" });
+      }
+    </script>
+  </body>
+</html>
