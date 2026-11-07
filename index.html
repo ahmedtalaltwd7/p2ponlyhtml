@@ -1,5 +1,5 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="manifest" href="manifest.json"><title>LocalDrop PoC</title>
+<link rel="manifest" href="manifest.json"><link rel="icon" href="assets/icons/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="assets/icons/icon-180.png"><meta name="theme-color" content="#2563eb"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>LocalDrop</title>
 <style>
 :root{--bg:#fff;--fg:#0f172a;--card:#f1f5f9;--ac:#2563eb}
 @media(prefers-color-scheme:dark){:root{--bg:#0f172a;--fg:#e2e8f0;--card:#1e293b;--ac:#60a5fa}}
@@ -11,6 +11,7 @@ textarea{width:100%;height:80px;box-sizing:border-box;font:11px monospace}
 .f{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #8884;gap:6px}
 .f span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 progress{width:100%}
+.notify{display:flex;align-items:center;gap:8px;margin:6px 0}.notify small{line-height:1.35}
 </style></head><body>
 <h2>LocalDrop <small>(PoC)</small></h2>
 <section><b>1. Library</b> <small id="stor"></small><br>
@@ -18,6 +19,7 @@ progress{width:100%}
 <div id="list"></div></section>
 <section><b>2. Connect</b> — <span id="st">not connected</span><br>
 <button onclick="create()">1. Make code</button><button class="s" onclick="pasteCode()">2. Paste code</button><button class="s" onclick="scan()">Scan QR</button><button class="s" onclick="copyOut()">Copy code</button>
+<div class="notify"><button class="s" id="notifyBtn" onclick="toggleNotifications()">Enable notifications</button><small id="notifyStatus" aria-live="polite">Optional alerts for completed transfers.</small></div>
 <div id="qrbox"></div><video id="vid" playsinline muted hidden style="width:100%;max-width:320px" onclick="stopScan()"></video>
 <div id="msg"><small>Device A: “Make code” (QR appears). Device B: “Scan QR” → its answer QR appears. Device A: “Scan QR” again. Copy/paste still works as a fallback.</small></div>
 <textarea id="inp" placeholder="Or paste the code here" oninput="auto()"></textarea>
@@ -26,7 +28,9 @@ progress{width:100%}
 <script src="assets/vendor/qrcode.js"></script><script src="assets/vendor/jsQR.js"></script>
 <script>
 const $=id=>document.getElementById(id),CH=65536,HIGH=1<<20,MAXHASH=200<<20;
-if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+let swReg=null;
+let alertsEnabled=false;try{alertsEnabled=localStorage.getItem('localdrop-alerts')==='1'}catch(e){}
+if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').then(r=>{swReg=r;updateNotifyUI()}).catch(()=>updateNotifyUI());
 // ---------- DB ----------
 let db;const dbp=new Promise((res,rej)=>{const r=indexedDB.open('LocalDropDB',1);
 r.onupgradeneeded=()=>{const d=r.result;d.createObjectStore('Files',{keyPath:'id'});d.createObjectStore('Transfers',{keyPath:'id'});d.createObjectStore('Settings',{keyPath:'key'})};
@@ -101,7 +105,37 @@ async function auto(){const v=$('inp').value.trim();if(v.length<40||busy)return;
  $('inp').value='';busy=false}
 function setup(ch){dc=ch;dc.binaryType='arraybuffer';dc.bufferedAmountLowThreshold=CH*4;
  dc.onopen=()=>{$('st').textContent='connected — data channel open';clearInterval(qt);$('qrbox').innerHTML=''};dc.onclose=()=>$('st').textContent='disconnected';
- dc.onmessage=onMsg}
+ dc.onmessage=onMsg;
+ dc.addEventListener('open',()=>notify('Connected','A peer-to-peer connection is ready.','connection-open'));
+ dc.addEventListener('close',()=>notify('Connection closed','The peer-to-peer session has ended.','connection-closed'))}
+function updateNotifyUI(){
+ const b=$('notifyBtn'),s=$('notifyStatus');if(!b||!s)return;
+ if(!('Notification'in window)){b.disabled=true;b.textContent='Notifications unavailable';s.textContent=isSecureContext?'This browser does not support notifications.':'Notifications require HTTPS or localhost.';return}
+ if(/iPhone|iPad|iPod/.test(navigator.userAgent)&&!navigator.standalone&&!matchMedia('(display-mode: standalone)').matches){b.disabled=true;b.textContent='Install for notifications';s.textContent='On iPhone or iPad, add LocalDrop to the Home Screen first.';return}
+ if(Notification.permission==='granted'){b.disabled=false;b.textContent=alertsEnabled?'Turn off alerts':'Turn on alerts';s.textContent=alertsEnabled?'Transfer and connection alerts are on.':'Notifications are allowed; alerts are off.'}
+ else if(Notification.permission==='denied'){b.disabled=true;b.textContent='Notifications blocked';s.textContent='Allow notifications for this site in browser settings.'}
+ else{b.disabled=false;b.textContent='Enable notifications';s.textContent='Optional alerts for transfers while LocalDrop is open.'}
+}
+async function toggleNotifications(){
+ if(!('Notification'in window))return updateNotifyUI();
+ if(Notification.permission==='granted'){
+  alertsEnabled=!alertsEnabled;try{localStorage.setItem('localdrop-alerts',alertsEnabled?'1':'0')}catch(e){}
+  updateNotifyUI();if(alertsEnabled)await notify('LocalDrop alerts enabled','You’ll be alerted when transfers finish.','notifications-enabled');return
+ }
+ try{
+  const permission=await Notification.requestPermission();updateNotifyUI();
+  if(permission==='granted'){alertsEnabled=true;try{localStorage.setItem('localdrop-alerts','1')}catch(e){};updateNotifyUI();await notify('LocalDrop alerts enabled','You’ll be alerted when transfers finish.','notifications-enabled')}
+ }catch(e){$('notifyStatus').textContent='Could not enable notifications in this browser.'}
+}
+async function notify(title,body,tag){
+ if(!alertsEnabled||!('Notification'in window)||Notification.permission!=='granted')return;
+ const options={body,icon:'assets/icons/icon-192.png',badge:'assets/icons/icon-192.png',tag,renotify:false,data:{url:'./'}};
+ try{
+  const reg=swReg||('serviceWorker'in navigator?await navigator.serviceWorker.getRegistration():null);
+  if(reg&&reg.showNotification)await reg.showNotification(title,options);else new Notification(title,options);
+ }catch(e){}
+}
+window.addEventListener('focus',updateNotifyUI);updateNotifyUI();
 // ---------- transfer ----------
 const J=o=>dc.send(JSON.stringify(o)),waits={},rows={};let rx=null;
 const sha=async b=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',b))].map(x=>x.toString(16).padStart(2,'0')).join('');
@@ -113,17 +147,18 @@ async function sendFile(f){if(!dc||dc.readyState!=='open')return alert('Not conn
  const id=crypto.randomUUID(),r=row(id,'↑ '+f.name);r.s.textContent='Hashing…';
  const sum=f.size<=MAXHASH?await sha(await f.blob.arrayBuffer()):null;
  J({t:'FILE_OFFER',id,name:f.name,type:f.type,size:f.size,chunkSize:CH,chunks:Math.ceil(f.size/CH),mod:f.lastModified});
- r.b.onclick=()=>{r.cancel=true;try{J({t:'FILE_CANCEL',id})}catch(e){}};
+ r.b.onclick=()=>{r.cancel=true;try{J({t:'FILE_CANCEL',id})}catch(e){};waits[id]&&waits[id](false)};
  r.s.textContent='Waiting for receiver…';
- if(!(await wait(id))){r.s.textContent='Rejected/cancelled';return}
+ if(!(await wait(id))){r.s.textContent=r.cancel?'Cancelled':'Rejected/cancelled';if(!r.cancel)notify('Transfer declined',`${f.name} was declined by the receiving device.`,'declined-'+id);return}
  r.t0=Date.now();let off=0;
  try{while(off<f.size&&!r.cancel){
   if(dc.bufferedAmount>HIGH)await new Promise(res=>dc.onbufferedamountlow=res);
   const buf=await f.blob.slice(off,off+CH).arrayBuffer();dc.send(buf);off+=buf.byteLength;prog(r,off,f.size)}
- if(r.cancel){r.s.textContent='Cancelled';return}
+ if(r.cancel){r.s.textContent='Cancelled';notify('Transfer cancelled',`${f.name} was cancelled.`,'cancelled-'+id);return}
  J({t:'FILE_COMPLETE',id,sha256:sum});r.s.textContent='Verifying on receiver…';
- const ok=await wait(id+'a');r.s.textContent=ok?'✓ Delivered & verified'+(sum?' (SHA-256)':' (size only; >200 MB)'):'✗ Verification failed';r.b.remove()
- }catch(e){r.s.textContent='Error: '+e.message}}
+ const ok=await wait(id+'a');r.s.textContent=ok?'✓ Delivered & verified'+(sum?' (SHA-256)':' (size only; >200 MB)'):'✗ Verification failed';r.b.remove();
+ notify(ok?'File sent':'Transfer failed',ok?`${f.name} · ${fmt(f.size)} · verified on the receiving device.`:`${f.name} could not be verified or saved.`,(ok?'sent-':'failed-')+id)
+ }catch(e){r.s.textContent='Error: '+e.message;notify('Transfer failed',`${f.name}: ${e.message}`,'error-'+id)}}
 async function onMsg(e){
  if(typeof e.data!=='string'){if(!rx||rx.dead)return;rx.parts.push(e.data);rx.got+=e.data.byteLength;prog(rx.r,rx.got,rx.size);return}
  const m=JSON.parse(e.data);
@@ -131,12 +166,13 @@ async function onMsg(e){
   const r=row(m.id,'↓ '+m.name);rx={...m,parts:[],got:0,r};r.b.onclick=()=>{rx.dead=true;J({t:'FILE_CANCEL',id:m.id});r.s.textContent='Cancelled'};J({t:'FILE_ACCEPT',id:m.id})}
  else if(m.t==='FILE_ACCEPT'){waits[m.id]&&waits[m.id](true)}
  else if(m.t==='FILE_REJECT'){waits[m.id]&&waits[m.id](false)}
- else if(m.t==='FILE_CANCEL'){if(rx&&rx.id===m.id){rx.dead=true;rx.r.s.textContent='Cancelled by sender'}if(rows[m.id])rows[m.id].cancel=true;waits[m.id]&&waits[m.id](false)}
+ else if(m.t==='FILE_CANCEL'){if(rx&&rx.id===m.id){rx.dead=true;rx.r.s.textContent='Cancelled by sender';notify('Transfer cancelled',`${rx.name} was cancelled by the sending device.`,'remote-cancel-'+m.id)}if(rows[m.id])rows[m.id].cancel=true;waits[m.id]&&waits[m.id](false)}
  else if(m.t==='FILE_COMPLETE'&&rx&&rx.id===m.id&&!rx.dead){
   const blob=new Blob(rx.parts,{type:rx.type});let ok=blob.size===rx.size;
   if(ok&&m.sha256)ok=(await sha(await blob.arrayBuffer()))===m.sha256;
   if(ok){try{await saveFile(blob,rx.name,rx.type,rx.mod,m.sha256);render()}catch(e){ok=false}}
-  rx.r.s.textContent=ok?'✓ Saved to library (verified)':'✗ Verification/save failed';rx.r.b.remove();J({t:'TRANSFER_ACK',id:m.id,ok});rx=null}
+  rx.r.s.textContent=ok?'✓ Saved to library (verified)':'✗ Verification/save failed';rx.r.b.remove();J({t:'TRANSFER_ACK',id:m.id,ok});
+  notify(ok?'File received':'Could not save file',ok?`${rx.name} · ${fmt(rx.size)} · saved and verified.`:`${rx.name} failed verification or could not be saved.`,(ok?'received-':'receive-failed-')+m.id);rx=null}
  else if(m.t==='TRANSFER_ACK'){waits[m.id+'a']&&waits[m.id+'a'](m.ok)}
  else if(m.t==='PING')J({t:'PONG'})}
 </script></body></html>
